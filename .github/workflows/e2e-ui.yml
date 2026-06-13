@@ -1,0 +1,287 @@
+name: E2E UI Tests
+
+# Runs the Playwright UI suite against a freshly built ap-web
+# SPA + a hello_world test agent, split across a 3-shard matrix
+# (pytest-shard, same pattern as e2e.yml) so wall-clock stays low
+# enough to gate PRs on as the suite grows. Lives in its own
+# workflow rather than as a sibling job in nightly.yml because the
+# setup (Node + npm + Playwright + SPA build) is structurally
+# disjoint from the inner-only legs and would bloat that workflow's
+# matrix.
+#
+# Triggers:
+#   pull_request        opened / synchronize / reopened /
+#                       ready_for_review. Draft PRs are skipped.
+#   push (main)         post-merge run on the default branch.
+#   schedule            09:00 UTC daily, alongside nightly.yml.
+#   workflow_dispatch   manual run. Input `branch` selects a non-main
+#                       ref.
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to run UI tests against"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+concurrency:
+  # PR re-syncs share a group by PR number so old runs cancel.
+  # workflow_dispatch with a branch input shares a group so manual
+  # re-dispatches against the same branch cancel. Push and schedule
+  # events key by SHA so back-to-back merges to `main` each get
+  # their own run -- needed for per-commit regression visibility.
+  group: e2e-ui-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
+  cancel-in-progress: true
+
+env:
+  # No SPA build during `uv sync` (setup.py `_build_web_ui`): this
+  # workflow builds the bundle itself in a dedicated `npm ci && npm run
+  # build` step, so the setup.py build would be a redundant ~10min that
+  # also hits public npm (no registry mirror here).
+  OMNIGENT_SKIP_WEB_UI: "true"
+  # Scrub harness credentials the test server must not pick up.
+  # OPENAI_API_KEY / OPENAI_BASE_URL are intentionally NOT scrubbed here
+  # — the "Run UI e2e tests" step sets them to the freshly-minted
+  # Databricks bearer + workspace serving-endpoints URL so the spawned
+  # hello_world agent (openai-agents harness against Databricks Model
+  # Serving) can authenticate. The previous shape scrubbed both and
+  # expected the agent to fall back to ~/.databrickscfg, but the SDK's
+  # default-profile lookup didn't resolve our OAuth M2M config in CI,
+  # which is what was failing the LLM calls.
+  ANTHROPIC_API_KEY: ""
+  DATABRICKS_TOKEN: ""
+  CODEX: ""
+  CLAUDE_CODE: ""
+  # Match e2e.yml's proxy choice.
+  UV_INDEX_URL: https://pypi.org/simple
+  # GitHub-hosted runners default to TERM=dumb, which makes the
+  # terminal-attach test's PTY shell error out on "clear". Set a real
+  # terminfo so the spawned PTY (and any nested tools that probe TERM)
+  # can resolve clear/cursor sequences. Inherited by the agent server
+  # subprocess via the conftest's env={**os.environ, ...} plumbing.
+  TERM: xterm-256color
+
+jobs:
+  e2e-ui:
+    name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    # Skip on draft PRs; the `ready_for_review` trigger re-fires the
+    # workflow when the draft is converted, so the check won't strand
+    # pending on the eventual ready-for-review state.
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # One red shard shouldn't cancel siblings; we want every shard's
+      # signal so reviewers can see whether the failure is broad or
+      # localized to one chunk.
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        # 3 shards: pytest-shard splits test node IDs deterministically,
+        # so the same test always lands in the same shard across runs.
+        # Each shard pays the full setup cost (uv sync + npm build +
+        # Playwright install, all cached), so more shards buy less once
+        # per-shard test time approaches setup time. Bump the count if
+        # shard runtime creeps up again. The shard check names are
+        # listed in .github/scripts/merge-ready/required.sh -- keep the
+        # two in sync when changing the count.
+        include:
+          - shard_id: 0
+            num_shards: 3
+          - shard_id: 1
+            num_shards: 3
+          - shard_id: 2
+            num_shards: 3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up Node 20
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ap-web/package-lock.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+      - name: Set LLM credentials
+        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
+
+      - name: Install project + dev extras
+        run: uv sync --extra all --extra dev
+
+      - name: Install bubblewrap
+        # The UI tests boot a real server and open terminals, which run
+        # under os_env. An agent/terminal that omits `os_env.sandbox.type`
+        # defaults to `linux_bwrap` on Linux and fails loud at runtime if
+        # `bwrap` is missing (rather than silently running unsandboxed), so
+        # the terminal never launches and the right-panel terminal assertion
+        # fails. Install `bubblewrap` like ci.yml / e2e.yml. The apparmor
+        # sysctl mirrors ci.yml: Ubuntu 24.04 blocks unprivileged user
+        # namespaces by default, which `bwrap`'s `unshare(CLONE_NEWUSER)`
+        # needs.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright Chromium
+        run: |
+          uv run playwright install --with-deps chromium
+
+      - name: Build ap-web SPA
+        # Build BEFORE pytest. Vite's emptyOutDir clobbers the
+        # static dir, so we never want this happening under xdist
+        # workers or interleaved with the running server.
+        #
+        # The lockfile already pins the dependency tree. `--legacy-peer-deps`
+        # prevents npm from spending the whole job re-resolving the known
+        # React 19 peer-dependency conflict under @emoji-mart/react.
+        #
+        # registry.npmjs.org TLS handshakes flake (ECONNRESET) on this
+        # runner pool — route npm through the Databricks proxy. The
+        # public export rewrites this URL back to the npmjs default.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          cd ap-web
+          npm ci --legacy-peer-deps --no-audit --no-fund
+          npm run build
+
+
+
+      - name: Run UI e2e tests
+        # --ui-skip-build: the SPA was already built in the previous
+        # step, so skip the fixture's own npm ci + build pass.
+        #
+        # pytest-playwright defaults --tracing/--screenshot/--video all
+        # to "off", so without these flags test-results/ stays empty
+        # and the failure-upload step has nothing to grab. retain-on-failure
+        # keeps the CI cost ~zero on green runs while giving us a full
+        # trace + video to step through when something breaks.
+        #
+        # OPENAI_API_KEY / OPENAI_BASE_URL are propagated by the
+        # conftest's live_server fixture (env={**os.environ, ...}) into
+        # the spawned `omnigent server --agent` subprocess, where the
+        # openai-agents harness picks them up as the Databricks Model
+        # Serving endpoint + bearer (see
+        # omnigent/inner/openai_agents_sdk_executor.py:387).
+        env:
+          OPENAI_API_KEY: ${{ env.LLM_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          # Scheduled / manually dispatched runs are the full pass;
+          # PR and push runs exclude @pytest.mark.nightly tests.
+          NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          SHARD_ID: ${{ matrix.shard_id }}
+          NUM_SHARDS: ${{ matrix.num_shards }}
+        run: |
+          EXTRA_ARGS=()
+          if [[ "$NIGHTLY_FULL" != "true" ]]; then
+            EXTRA_ARGS+=(-m "not nightly")
+          fi
+          # --shard-id/--num-shards (pytest-shard) split the test node
+          # IDs deterministically across the matrix entries; same set
+          # of tests overall, just chunked.
+          uv run pytest tests/e2e_ui \
+            -v --tb=long --showlocals --log-level=INFO -r a \
+            --ui-skip-build \
+            --shard-id="$SHARD_ID" \
+            --num-shards="$NUM_SHARDS" \
+            --tracing=retain-on-failure \
+            --screenshot=only-on-failure \
+            --video=retain-on-failure \
+            "${EXTRA_ARGS[@]}" \
+            || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+
+      - name: Upload Playwright traces / videos / screenshots on failure
+        id: upload_playwright
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          # Shard suffix keeps the matrix's parallel uploads from
+          # colliding on the same artifact name (v4 409s on dupes).
+          name: e2e-ui-playwright-${{ github.run_id }}-shard${{ matrix.shard_id }}
+          # ``playwright-report/`` is the JS-runner's HTML report dir and
+          # is never produced by pytest-playwright — left in the path
+          # list for forward-compat (``if-no-files-found: ignore`` keeps
+          # it silent when absent).
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Upload server logs on failure
+        id: upload_server_logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
+          # The conftest's ``live_server`` fixture writes server.log
+          # under ``tmp_path_factory.mktemp("e2e_ui_server")``, which
+          # resolves to ``/tmp/pytest-of-runner/pytest-*/e2e_ui_server*/``
+          # on GitHub-hosted runners. The previous glob targeted
+          # ``e2e_ui_logs*``, which never matched, so the artifact was
+          # always empty.
+          path: /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Surface failure artifacts on job summary
+        # GH groups artifact uploads inside the step they ran in, which
+        # means triagers have to expand the right step + scroll to find
+        # the download link. Writing to GITHUB_STEP_SUMMARY puts a flat,
+        # always-visible Markdown block at the top of the job summary
+        # page with direct links to every artifact this job produced.
+        if: failure()
+        env:
+          PLAYWRIGHT_URL: ${{ steps.upload_playwright.outputs.artifact-url }}
+          SERVER_LOGS_URL: ${{ steps.upload_server_logs.outputs.artifact-url }}
+        run: |
+          {
+            echo "## Failure artifacts"
+            echo
+            echo "Direct downloads (retention 3 days):"
+            echo
+            if [ -n "${PLAYWRIGHT_URL}" ]; then
+              echo "- 🎬 [Playwright trace / video / screenshots](${PLAYWRIGHT_URL})"
+            else
+              echo "- 🎬 Playwright trace: _no artifact uploaded (test-results/ was empty)_"
+            fi
+            if [ -n "${SERVER_LOGS_URL}" ]; then
+              echo "- 📜 [omnigent server log](${SERVER_LOGS_URL})"
+            else
+              echo "- 📜 server.log: _no artifact uploaded (glob matched nothing)_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

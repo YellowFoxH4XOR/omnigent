@@ -1,0 +1,17 @@
+# Citation metadata. See https://citation-file-format.github.io/
+#
+# Placeholder: the public project name, repository URL, and release version are
+# not yet finalized (tracked in designs/OPEN_SOURCING_PLAN.md). Fill the TODO
+# fields, and add a `version:`, `date-released:`, and `doi:` if desired, when
+# the public repo is created.
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: "Omnigent"
+abstract: "Declarative framework for authoring and running agents, tools, and sessions."
+type: software
+authors:
+  - name: "Databricks, Inc."
+license: Apache-2.0
+# TODO(public repo): set to the public repository URL once the org/repo name is decided.
+# repository-code: "https://github.com/<org>/<repo>"
+# url: "https://github.com/<org>/<repo>"

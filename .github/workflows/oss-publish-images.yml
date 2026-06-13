@@ -1,0 +1,127 @@
+# Builds the server image and pushes it to ghcr.io/omnigent-ai/omnigent-server,
+# the image every deploy template references. ubuntu-latest, GHCR via
+# GITHUB_TOKEN.
+#
+# Also builds + pushes the Omnigent host image (the `host` target of the
+# same Dockerfile) as ghcr.io/omnigent-ai/omnigent-host with the identical
+# trigger / permission / login / tag setup — the default image for
+# `omnigent sandbox create --provider modal` and server-launched managed
+# hosts.
+#
+# The Dockerfile ARGs default to public registries, so no build-args are
+# needed. Actions are SHA-pinned per repo convention.
+#
+# First run creates the GHCR packages PRIVATE; to allow unauthenticated pulls,
+# flip them to public once in the org package settings (cannot be done in CI).
+name: Publish images (public)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    # Only rebuild when something that lands in the image changes.
+    paths:
+      - 'deploy/docker/Dockerfile'
+      - 'deploy/docker/entrypoint.py'
+      - 'omnigent/**'
+      - 'ap-web/**'
+      - 'sdks/**'
+      - 'pyproject.toml'
+      - 'setup.py'
+      - 'uv.lock'
+      - 'ap-web/package-lock.json'
+      - '.github/workflows/oss-publish-images.yml'
+  workflow_dispatch: {}
+
+# Read-only at the top level (Scorecard Token-Permissions); the write
+# scopes live on the job(s) below.
+permissions:
+  contents: read
+
+concurrency:
+  # Key by SHA so back-to-back merges each build; don't cancel a queued
+  # build mid-push.
+  group: oss-publish-images-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    permissions:
+      contents: read
+      packages: write # push the image to GHCR via GITHUB_TOKEN
+    # Gated to this repository; inert in forks and mirrors.
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # :latest tracks main HEAD; :sha-<short> is the immutable per-commit
+      # pin; a v* tag publishes :vX.Y.Z and re-points :latest. Server and
+      # host images share the same scheme.
+      # ref / ref_name go through env, not inline ${{ }}, so a crafted tag
+      # name cannot inject shell.
+      - name: Compute image tags
+        id: tags
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/omnigent-ai/omnigent-server"
+          HOST_IMAGE="ghcr.io/omnigent-ai/omnigent-host"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAGS="${IMAGE}:sha-${SHORT_SHA}"
+          HOST_TAGS="${HOST_IMAGE}:sha-${SHORT_SHA}"
+          if [ "${GH_REF}" = "refs/heads/main" ]; then
+            TAGS="${TAGS},${IMAGE}:latest"
+            HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:latest"
+          fi
+          if [[ "${GH_REF}" == refs/tags/v* ]]; then
+            TAGS="${TAGS},${IMAGE}:${GH_REF_NAME},${IMAGE}:latest"
+            HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:${GH_REF_NAME},${HOST_IMAGE}:latest"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "host_tags=${HOST_TAGS}" >> "$GITHUB_OUTPUT"
+
+      # No build-args: the Dockerfile ARGs default to public registries.
+      - name: Build and push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      # Host image: same Dockerfile, `host` target. Runs after the server
+      # build so it reuses the shared builder-stage layers from the gha
+      # cache — the host-only runtime stage is the only extra work.
+      - name: Build and push host image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: host
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.host_tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false

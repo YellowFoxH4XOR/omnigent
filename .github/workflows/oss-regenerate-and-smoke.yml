@@ -1,0 +1,148 @@
+# Regenerate the repo's lockfiles against PUBLIC PyPI/npm, then validate
+# the Docker build + a CLI smoke. Runs on GitHub-hosted `ubuntu-latest`
+# specifically so resolution sees the public registries directly — the
+# lockfiles must record public sources, never a mirror or proxy.
+#
+# Why this exists: sync PRs land manifest changes without lockfile updates
+# (lockfiles are regenerated, not synced), and the Dockerfile `COPY`s
+# `ap-web/package-lock.json`, so the tree is not Docker-buildable until
+# the lockfiles are (re)generated here.
+#
+# Actions are SHA-pinned (with a trailing version comment) per the repo
+# convention and the SecOps day-1 requirement; the pins match the SHAs
+# already used by sibling workflows in this repo.
+name: OSS regenerate lockfiles + smoke
+
+on:
+  workflow_dispatch: {}
+  # Re-lock only when dependency manifests move (the bot commits lockfiles,
+  # which are NOT in these paths, so this never self-triggers a loop).
+  push:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "ap-web/package.json"
+  # Weekly freshness sweep.
+  schedule:
+    - cron: "0 6 * * 1"
+
+# Read-only at the top level (Scorecard Token-Permissions); the write
+# scopes live on the job(s) below.
+permissions:
+  contents: read
+
+# Serialize runs on the same ref so a manifest push and a manual dispatch
+# (or a weekly sweep) don't both force-push the regen branch at once.
+# cancel-in-progress is false (not true): a queued run starts AFTER the
+# prior one finishes, so it checks out the just-updated main, regenerates
+# identical lockfiles, and exits clean on "nothing to commit" — instead of
+# cancelling a run that may be mid-push.
+concurrency:
+  group: oss-regenerate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  regenerate-and-smoke:
+    permissions:
+      contents: write # push the regen branch
+      pull-requests: write # open / update the regen PR
+    # Gated to this repository; inert in forks and mirrors.
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    # Bound a hung run well under GitHub's 6-hour default. The canary runs in
+    # ~3 min; 30 leaves headroom for a cold Docker build (FE compile + uv
+    # install) without letting a wedged build burn runner hours.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up uv (clean public resolution, no proxy cache)
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        with:
+          enable-cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "20"
+
+      # 1. Regenerate uv.lock from pyproject against public PyPI. The
+      # 7-day dependency cooldown comes from the repo's uv.toml
+      # (`exclude-newer = "P7D"`), recorded in the lock as a relative
+      # span — an env-var cutoff here would instead stamp an absolute
+      # date into the lock and break later `uv sync --locked` runs.
+      - name: Regenerate uv.lock
+        run: uv lock
+
+      # 2. Regenerate ap-web/package-lock.json against public npm. Lockfile
+      #    only (the Docker build does the full install) — fast, deterministic.
+      - name: Regenerate package-lock.json
+        working-directory: ap-web
+        run: npm install --package-lock-only --no-audit --no-fund
+
+      # 3. Validate BEFORE committing: the Docker build is the real test that
+      #    the regenerated locks + public registries produce a working image
+      #    (FE build via npm + `uv pip install -e .`, all public by default —
+      #    the Dockerfile ARGs already default to pypi.org / public npm).
+      - name: Docker build (FE + Python, public registries)
+        run: docker build -f deploy/docker/Dockerfile -t omnigent-smoke .
+
+      # 4. CLI smoke. No secrets needed for --help; an actual agent run would
+      #    need a public LLM key (wire ${{ secrets.LLM_API_KEY }} when desired).
+      - name: CLI smoke
+        run: docker run --rm omnigent-smoke omnigent --help
+
+      # 5. Persist the validated lockfiles via a PR (only if they changed and
+      #    the build above passed). A PR, not a direct push to main, so it
+      #    works once main is branch-protected. Created with a repo PAT
+      #    (secrets.OSS_REGEN_TOKEN) so `gh pr create` is not blocked by the
+      #    org "Allow Actions to create PRs" restriction and the regen PR runs
+      #    its own CI. No loop: this workflow's push trigger is path-scoped to
+      #    the manifests (pyproject.toml / package.json), and the PR only
+      #    touches lockfiles, so merging it never re-fires this workflow.
+      #    Falls back to GITHUB_TOKEN if the PAT is not configured (the step
+      #    then degrades gracefully — see the else branch below).
+      - name: Open lockfile-regen PR
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.OSS_REGEN_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Use `git status --porcelain`, not `git diff`: on the first regen
+          # the lockfiles are UNTRACKED (the public export ships without
+          # them), and `git diff` ignores untracked files — so `git diff
+          # --quiet` would false-negative and skip the PR. --porcelain
+          # reports untracked (??) and modified files alike.
+          if [ -z "$(git status --porcelain -- uv.lock ap-web/package-lock.json)" ]; then
+            echo "Lockfiles already current — nothing to PR."
+            exit 0
+          fi
+          # One rolling branch, force-pushed each run, so repeated regens
+          # update a single PR instead of spawning a new one each time.
+          BRANCH="automation/oss-lockfile-regen"
+          git checkout -b "$BRANCH"
+          git add uv.lock ap-web/package-lock.json
+          git commit -m "chore(oss): regenerate public lockfiles against public PyPI/npm"
+          git push --force origin "$BRANCH"
+          # An already-open PR just picks up the force-pushed update.
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')" ]; then
+            echo "PR already open for $BRANCH — refreshed it with the latest lockfiles."
+            exit 0
+          fi
+          # Best-effort PR creation. The branch (with the regenerated
+          # lockfiles) is already pushed above, so the recoverable state is
+          # achieved regardless. If creation is still blocked — e.g. the PAT
+          # is unset and the GITHUB_TOKEN fallback is disallowed from creating
+          # PRs — DON'T fail the run red: print the one-liner to open it by
+          # hand and exit clean. (The `if` condition exempts gh from `set -e`,
+          # so a non-zero exit falls to the else branch instead of aborting.)
+          if gh pr create --base main --head "$BRANCH" \
+              --title "chore(oss): regenerate public lockfiles against public PyPI/npm" \
+              --body "Automated: regenerated uv.lock + ap-web/package-lock.json against public PyPI/npm, validated by a Docker build + omnigent --help smoke (run ${{ github.run_id }}). Merge to keep the public lockfiles current and buildable."; then
+            echo "Opened the regen PR."
+          else
+            echo "::warning::Could not open the regen PR automatically (the GITHUB_TOKEN may be disallowed from creating PRs). The branch '$BRANCH' is pushed with the regenerated lockfiles — open the PR by hand:"
+            echo "  gh pr create --repo ${{ github.repository }} --base main --head $BRANCH --title 'chore(oss): regenerate public lockfiles' --body 'Regenerated lockfiles against public PyPI/npm.'"
+          fi

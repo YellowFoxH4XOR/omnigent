@@ -1,0 +1,79 @@
+name: OSS Scorecard
+
+# OpenSSF Scorecard supply-chain posture scan. The job is gated to this
+# repository via `if: github.repository == 'omnigent-ai/omnigent'`, so it
+# stays inert (skipped) in forks and mirrors — no SARIF in their Security
+# tabs, no secrets required there. ubuntu-latest, GITHUB_TOKEN only.
+#
+# Results upload as SARIF to the public repo's code-scanning / Security
+# tab. Token-only for now: the Branch-Protection check needs a PAT
+# (`repo` + read:org) as repo_token to score fully; without one that one
+# check is inconclusive but every other check runs. publish_results is
+# off because the repo is private — once it goes public, flip
+# publish_results to true, add `id-token: write` to the job permissions,
+# and add the Scorecard badge to README.
+
+on:
+  # Re-score whenever branch protection changes (the check Scorecard
+  # cares most about), weekly, and on push to the default branch.
+  branch_protection_rule:
+  schedule:
+    - cron: '37 4 * * 1'  # Mondays 04:37 UTC
+  push:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    if: ${{ github.repository == 'omnigent-ai/omnigent' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      security-events: write  # upload the SARIF result to code scanning
+      contents: read
+      actions: read
+    steps:
+      # Scorecard's GraphQL queries (ListCommits, etc.) are not accessible to
+      # the default GITHUB_TOKEN on a PRIVATE repo — it fails with "Resource
+      # not accessible by integration". A classic PAT (repo + read:org) stored
+      # as the SCORECARD_TOKEN secret is required while the repo is private;
+      # once it's public the default token would suffice. Skip cleanly (green,
+      # no analysis) until the secret is set so this never paints a red check.
+      - name: Check for Scorecard token
+        id: gate
+        env:
+          SCORECARD_TOKEN: ${{ secrets.SCORECARD_TOKEN }}
+        run: |
+          if [[ -n "$SCORECARD_TOKEN" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SCORECARD_TOKEN not set; skipping Scorecard (a PAT is required while the repo is private)."
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.ready == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        if: steps.gate.outputs.ready == 'true'
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a  # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # PAT (repo + read:org); required for the GraphQL queries on a
+          # private repo. Set as a repo/org Actions secret on Omnigent.
+          repo_token: ${{ secrets.SCORECARD_TOKEN }}
+          # Private repo: don't publish to the public OpenSSF API. Flip to
+          # true (and add id-token: write above) once the repo is public.
+          publish_results: false
+
+      - name: Upload SARIF to code scanning
+        if: steps.gate.outputs.ready == 'true'
+        uses: github/codeql-action/upload-sarif@c35d1b164463ee62a100735382aaaa525c5d3496  # codeql-bundle-v2.25.6
+        with:
+          sarif_file: results.sarif

@@ -1,0 +1,279 @@
+name: Merge Ready
+
+# Posts a "Merge Ready" commit status on the PR head SHA. That status
+# is the single required check in branch protection; the REQUIRED list
+# inside this workflow defines what backs it.
+#
+# Per trigger:
+#   /merge comment   always evaluate, post green or red, enable GitHub
+#                    auto-merge, drop a sticky comment.
+#   pull_request     skipped unless PR has `automerge` label. With
+#                    label, evaluate and post green or red. When the
+#                    `automerge` label was just added (action=labeled),
+#                    also enable GitHub auto-merge on the PR so it
+#                    merges automatically once the gate turns green.
+#   workflow_run     always evaluate. Posts green or red with the
+#                    `automerge` label. Without label, posts only
+#                    when the gate is fully green, so the PR flips
+#                    to all-green naturally after CI without flicker.
+#
+# Labels:
+#   automerge        enable GitHub auto-merge (one-shot when label is
+#                    added) AND opt into continuous gate updates
+#                    (green AND red).
+#   force-merge      bypass: posts green regardless of CI state, but
+#                    ONLY when the PR author is a maintainer or a
+#                    maintainer has approved the PR. The maintainer
+#                    list is read at runtime from .github/MAINTAINER
+#                    at main's tip (never the PR head SHA -- a PR
+#                    that edits MAINTAINER to grant itself bypass
+#                    should not take effect until merged). When the
+#                    label is applied without maintainer involvement
+#                    and CI is also red, the workflow posts a red
+#                    status that explains why the bypass was
+#                    rejected.
+#
+# Status is posted via the REST API rather than the job's implicit
+# check run because `workflow_run` and `issue_comment` jobs execute on
+# the default branch; an explicit POST against the PR head SHA puts
+# the status on the right commit.
+
+on:
+  # `labeled` only -- other PR events fired a skipped run on the
+  # checks panel. `workflow_run` re-evaluates on CI completion.
+  pull_request:
+    types: [labeled]
+  workflow_run:
+    workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests]
+    types: [completed]
+  issue_comment:
+    types: [created]
+
+# Read-only at the top level (Scorecard Token-Permissions); the write
+# scopes live on the job below.
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-ready-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  evaluate:
+    name: evaluate
+    permissions:
+      contents: write       # enable PR merge for `/merge`
+      pull-requests: write  # post comments + enable auto-merge
+      checks: read
+      actions: read         # evaluate-checks.sh reads GET /actions/runs to classify missing checks
+      statuses: write
+    # Fire on automerge/force-merge label adds, PR-triggered
+    # workflow_run completions, or `/merge` comments. Other label
+    # adds no longer skip-run here.
+    #
+    # workflow_run is filtered to PR-originated runs. Post-merge
+    # runs on `main` (workflow_run.event == 'push') and nightlies
+    # / manual dispatches (schedule / workflow_dispatch) have no
+    # PR to post a status on -- the context-resolution step below
+    # would skip them anyway, but we'd still spend ~15 s spinning
+    # up a runner. Filter at the job-`if:` level so push:main
+    # completions of the watched workflows don't spawn wasteful
+    # merge-ready runs per merge.
+    if: >-
+      (
+        github.event_name == 'pull_request' &&
+        (
+          github.event.label.name == 'automerge' ||
+          github.event.label.name == 'force-merge'
+        )
+      ) ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.event == 'pull_request'
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(github.event.comment.body, '/merge') &&
+        !endsWith(github.actor, '[bot]')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          sparse-checkout: .github/scripts/merge-ready
+          persist-credentials: false
+
+      - name: Resolve PR + head SHA
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Passed via env (not interpolated into the script): the JSON includes
+          # PR branch names, which a same-repo author controls, so direct
+          # interpolation would be a shell-injection vector.
+          WF_PRS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            PR="${{ github.event.pull_request.number }}"
+            SHA="${{ github.event.pull_request.head.sha }}"
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            PR="${{ github.event.issue.number }}"
+            SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+          else
+            PR=$(echo "$WF_PRS" | jq -r '.[0].number // empty')
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            if [[ -z "$PR" ]]; then
+              echo "::notice::Skipped: workflow_run has no associated PR (push to main, etc)"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "pr=$PR"   >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Read PR labels
+        id: labels
+        if: steps.ctx.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+        run: |
+          NAMES=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name')
+          for label in force-merge automerge; do
+            if echo "$NAMES" | grep -qx "$label"; then
+              echo "${label//-/_}=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "${label//-/_}=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+      - name: Load maintainers
+        id: maintainers
+        if: steps.ctx.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash .github/scripts/merge-ready/load-maintainers.sh
+
+      - name: Determine force-merge bypass eligibility
+        id: bypass
+        if: steps.ctx.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          FORCE_MERGE: ${{ steps.labels.outputs.force_merge }}
+          MAINTAINERS: ${{ steps.maintainers.outputs.list }}
+        run: bash .github/scripts/merge-ready/force-merge-eligibility.sh
+
+      # post_red gates whether a red gate state posts a Merge Ready
+      # status. /merge needs it; automerge / force-merge opt in. Without
+      # one of those triggers we only post green so partial CI doesn't
+      # paint red.
+      - name: Determine eligibility
+        id: eligible
+        if: steps.ctx.outputs.skip != 'true'
+        env:
+          EVENT:       ${{ github.event_name }}
+          AUTOMERGE:   ${{ steps.labels.outputs.automerge }}
+          FORCE_MERGE: ${{ steps.labels.outputs.force_merge }}
+        run: |
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT" == "issue_comment" ]] || [[ "$AUTOMERGE" == "true" ]] || [[ "$FORCE_MERGE" == "true" ]]; then
+            echo "post_red=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "post_red=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No 'automerge' or 'force-merge' label; will post Merge Ready only if the gate is green."
+          fi
+
+      - name: Evaluate required checks
+        id: eval
+        if: >-
+          steps.ctx.outputs.skip != 'true' &&
+          steps.eligible.outputs.run == 'true' &&
+          steps.bypass.outputs.effective == 'false'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.ctx.outputs.sha }}
+        run: bash .github/scripts/merge-ready/evaluate-checks.sh
+
+      - name: Compute gate outcome
+        id: gate
+        if: >-
+          steps.ctx.outputs.skip != 'true' &&
+          steps.eligible.outputs.run == 'true'
+        env:
+          FORCE_MERGE: ${{ steps.labels.outputs.force_merge }}
+          EFFECTIVE: ${{ steps.bypass.outputs.effective }}
+          REASON: ${{ steps.bypass.outputs.reason }}
+          EVAL: ${{ steps.eval.outcome }}
+          FAILED: ${{ steps.eval.outputs.failed }}
+        run: bash .github/scripts/merge-ready/compute-gate.sh
+
+      # Skipped when post_red is false AND gate is red: leaves prior
+      # status untouched so partial CI doesn't paint red.
+      - name: Post Merge Ready status on PR head SHA
+        if: >-
+          steps.ctx.outputs.skip != 'true' &&
+          steps.eligible.outputs.run == 'true' &&
+          (
+            steps.eligible.outputs.post_red == 'true' ||
+            steps.gate.outputs.state == 'success'
+          )
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO:     ${{ github.repository }}
+          SHA:      ${{ steps.ctx.outputs.sha }}
+          STATE:    ${{ steps.gate.outputs.state }}
+          DESC:     ${{ steps.gate.outputs.short_desc }}
+        run: |
+          gh api "repos/$REPO/statuses/$SHA" \
+            -f state="$STATE" \
+            -f context="Merge Ready" \
+            -f description="$DESC" >/dev/null
+          echo "Posted Merge Ready=$STATE on $SHA ($DESC)"
+
+      - name: Enable auto-merge on /merge
+        if: >-
+          github.event_name == 'issue_comment' &&
+          steps.ctx.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          GATE: ${{ steps.gate.outputs.long_desc }}
+        run: bash .github/scripts/merge-ready/enable-automerge-comment.sh
+
+      - name: Enable auto-merge on automerge label
+        if: >-
+          steps.ctx.outputs.skip != 'true' &&
+          github.event_name == 'pull_request' &&
+          github.event.action == 'labeled' &&
+          github.event.label.name == 'automerge' &&
+          steps.bypass.outputs.effective != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+        run: bash .github/scripts/merge-ready/enable-automerge-label.sh
+
+      # workflow_run only. On pull_request labeled, auto-merge was
+      # enabled in an earlier step; failing here makes the label look
+      # broken even though it worked.
+      - name: Fail job when gate is red
+        if: >-
+          github.event_name == 'workflow_run' &&
+          steps.ctx.outputs.skip != 'true' &&
+          steps.eligible.outputs.run == 'true' &&
+          steps.eligible.outputs.post_red == 'true' &&
+          steps.gate.outputs.state == 'failure'
+        run: |
+          echo "::error::Merge Ready gate is red for SHA ${{ steps.ctx.outputs.sha }}"
+          exit 1
