@@ -418,7 +418,8 @@ def _paginate_list_dir(
     strictly after the cursor; backward pagination (``before``)
     returns up to ``limit`` entries strictly before. Empty cursors
     return the first page. ``has_more`` is set when more entries
-    remain on the forward side of the slice.
+    remain in the pagination direction: forward of the page for
+    ``after``, before the page for ``before``.
 
     :param entries: Full sorted list of directory entries.
     :param request_id: Request id to echo back on the result frame.
