@@ -290,7 +290,9 @@ class UnifiedAuthProvider(AuthProvider):
     def get_user_id(self, request: HTTPConnection) -> str | None:
         """Extract user identity from the active source.
 
-        - ``"header"``: Read ``X-Forwarded-Email`` header.
+        - ``"header"``: Read the configured identity header
+          (default ``X-Forwarded-Email``; see
+          :func:`resolve_auth_header`).
         - ``"oidc"`` / ``"accounts"``: Read ``__Host-ap_session``
           cookie, validate HS256 signature and expiry, return
           ``sub`` claim.
@@ -409,9 +411,11 @@ def create_auth_provider() -> AuthProvider:
 
     Defaults to ``"header"`` when the env var is unset — a bare
     ``omnigent server`` is single-user, no-login out of the box.
-    Header mode rejects requests without ``X-Forwarded-Email``
-    (401, fail closed — see :meth:`UnifiedAuthProvider._check_header`)
-    unless the server is an explicit single-user local runtime
+    Header mode rejects requests without the configured identity
+    header (default ``X-Forwarded-Email``, overridable via
+    ``OMNIGENT_AUTH_HEADER``) — 401, fail closed; see
+    :meth:`UnifiedAuthProvider._check_header` — unless the server
+    is an explicit single-user local runtime
     (``OMNIGENT_LOCAL_SINGLE_USER=1``, set by the managed local
     spawn paths and the canonical bare loopback ``omnigent
     server``), where the absent header falls back to the reserved
