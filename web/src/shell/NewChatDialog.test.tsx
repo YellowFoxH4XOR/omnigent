@@ -1763,6 +1763,44 @@ describe("NewChatLandingScreen @-file-mention", () => {
     );
   });
 
+  it("suppresses stale parent rows while a drilled directory is still loading", async () => {
+    // ``useHostFilesystem`` keeps the previous directory's rows on screen as
+    // placeholder data while the next fetch is in flight (keepPreviousData):
+    // ``isLoading`` is false, only ``isPlaceholderData`` is true. If the menu
+    // rendered that placeholder it would show the *parent's* files as though
+    // they lived inside the drilled child, and a click/Enter would attach the
+    // wrong entry. The menu must collapse to "Loading…" until the child's own
+    // listing arrives.
+    const rootEntries = [dir(`${ROOT}/omnigent`), file(`${ROOT}/README.md`)];
+    useHostFilesystemMock.mockImplementation(((_hostId: string | null, path: string | null) => {
+      // Root resolves normally; the drilled path is still serving the parent's
+      // rows as placeholder data (the mid-fetch window we're regression-testing).
+      const isPlaceholderData = path !== ROOT;
+      return {
+        data: { entries: rootEntries, truncated: false },
+        isLoading: false,
+        error: null,
+        isPlaceholderData,
+      };
+    }) as unknown as typeof useHostFilesystem);
+
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    // Root listing renders its rows.
+    expect(screen.getByTitle("Open omnigent")).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Open omnigent"));
+
+    // Drilled-but-loading: the loading row shows and the parent's stale rows are
+    // gone (without the isPlaceholderData guard they'd appear as the child's).
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+    expect(screen.queryByTitle("Attach README.md")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
+  });
+
   it("attaches a whole folder with a trailing-slash marker", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,

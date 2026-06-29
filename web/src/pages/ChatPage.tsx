@@ -3568,8 +3568,8 @@ export function Composer({
   // attachment marker the executor already emits. In-process SDK sessions
   // get no mention menu, so the workspace listing is never fetched for them
   // (``enabled`` gate below). Codex's marker says "Attached file:" while the
-  // others say "Attached:" — see ``mentionMarkerFor``.
-  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  // others say "Attached:" — see ``mentionMarkerFor``. ``sessionHarness`` is
+  // already read above for the status-tray harness label.
   // Derive from the canonical native-agent registry (which folds reversed
   // spellings like ``native-pi``) rather than a literal harness-string compare,
   // so the composer's "@" entry point can't split-brain from the file viewer's

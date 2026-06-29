@@ -1968,6 +1968,14 @@ export function NewChatLandingScreen() {
   // then rank (folders-first, filtered, capped) via the shared helper.
   const mentionEntries: WorkspaceFile[] = useMemo(() => {
     if (!mentionEnabled || !mention) return [];
+    // ``useHostFilesystem`` keeps the previous directory's rows as placeholder
+    // data (no flicker on navigate). When the user drills into a folder a new
+    // fetch starts but ``data`` still holds the *parent's* entries — ``isLoading``
+    // is false, only ``isPlaceholderData`` is true. Returning those stale rows
+    // here would show the parent's files while purporting to be inside the
+    // child, so a click/Enter could attach the wrong entry. Suppress them until
+    // the current directory's own listing arrives.
+    if (mentionFsQuery.isPlaceholderData) return [];
     const rows = (mentionFsQuery.data?.entries ?? [])
       .filter((e) => e.type === "directory" || e.type === "file")
       .map(
@@ -1982,10 +1990,22 @@ export function NewChatLandingScreen() {
         }),
       );
     return rankMentionEntries(rows, mentionFilter);
-  }, [mentionEnabled, mention, mentionFsQuery.data, mentionFilter, workspaceRoot]);
+  }, [
+    mentionEnabled,
+    mention,
+    mentionFsQuery.data,
+    mentionFsQuery.isPlaceholderData,
+    mentionFilter,
+    workspaceRoot,
+  ]);
   const mentionOpen = mentionEntries.length > 0;
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
-  const mentionListingPending = mentionEnabled && mention != null && mentionFsQuery.isLoading;
+  // ``isPlaceholderData`` covers the drill-down window where react-query is
+  // still serving the previous directory's rows (``isLoading`` stays false).
+  const mentionListingPending =
+    mentionEnabled &&
+    mention != null &&
+    (mentionFsQuery.isLoading || mentionFsQuery.isPlaceholderData);
 
   // Shared selection/chip/keyboard glue — see useMentionBrowser. Only the
   // host-filesystem source + token state above are launcher-specific.
